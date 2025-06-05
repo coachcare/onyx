@@ -746,3 +746,7 @@ IMAGE_ANALYSIS_SYSTEM_PROMPT = os.environ.get(
 DISABLE_AUTO_AUTH_REFRESH = (
     os.environ.get("DISABLE_AUTO_AUTH_REFRESH", "").lower() == "true"
 )
+
+GITHUB_CONNECTOR_INCLUDE_CODE_FILES = (
+    os.environ.get("GITHUB_CONNECTOR_INCLUDE_CODE_FILES", "").lower() == "true"
+)

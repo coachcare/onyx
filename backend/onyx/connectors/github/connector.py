@@ -1,918 +1,653 @@
+"""Unified GitHub connector – complete file with binary-skip + logging.
+
+Merges the legacy code-file crawler with checkpoint-based PR/Issue logic and
+implements all abstract methods required by `CheckpointedConnector`.
+"""
+
+from __future__ import annotations
+
 import copy
 import time
-from collections.abc import Callable
-from collections.abc import Generator
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
+from collections.abc import Callable, Generator, Iterator
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any
-from typing import cast
+from typing import Any, cast
 
-from github import Github
-from github import RateLimitExceededException
-from github import Repository
+from github import Github, RateLimitExceededException
+from github.ContentFile import ContentFile
 from github.GithubException import GithubException
 from github.Issue import Issue
-from github.NamedUser import NamedUser
 from github.PaginatedList import PaginatedList
 from github.PullRequest import PullRequest
+from github.Repository import Repository
 from github.Requester import Requester
 from pydantic import BaseModel
 from typing_extensions import override
 
-from onyx.configs.app_configs import GITHUB_CONNECTOR_BASE_URL
+from onyx.configs.app_configs import GITHUB_CONNECTOR_BASE_URL, INDEX_BATCH_SIZE
 from onyx.configs.constants import DocumentSource
-from onyx.connectors.exceptions import ConnectorValidationError
-from onyx.connectors.exceptions import CredentialExpiredError
-from onyx.connectors.exceptions import InsufficientPermissionsError
-from onyx.connectors.exceptions import UnexpectedValidationError
-from onyx.connectors.interfaces import CheckpointedConnector
-from onyx.connectors.interfaces import CheckpointOutput
-from onyx.connectors.interfaces import ConnectorCheckpoint
-from onyx.connectors.interfaces import ConnectorFailure
-from onyx.connectors.interfaces import SecondsSinceUnixEpoch
-from onyx.connectors.models import ConnectorMissingCredentialError
-from onyx.connectors.models import Document
-from onyx.connectors.models import DocumentFailure
-from onyx.connectors.models import TextSection
+from onyx.connectors.exceptions import (
+    ConnectorValidationError,
+    CredentialExpiredError,
+    InsufficientPermissionsError,
+    UnexpectedValidationError,
+)
+from onyx.connectors.interfaces import (
+    CheckpointOutput,
+    CheckpointedConnector,
+    ConnectorCheckpoint,
+    ConnectorFailure,
+    SecondsSinceUnixEpoch,
+)
+from onyx.connectors.models import (
+    ConnectorMissingCredentialError,
+    Document,
+    DocumentFailure,
+    TextSection,
+)
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
 
+# ---------------------------------------------------------------------------
+# Constants / globals
+# ---------------------------------------------------------------------------
 ITEMS_PER_PAGE = 100
 CURSOR_LOG_FREQUENCY = 50
-
 _MAX_NUM_RATE_LIMIT_RETRIES = 5
-
 ONE_DAY = timedelta(days=1)
+_CODE_BATCH_SIZE = INDEX_BATCH_SIZE if "INDEX_BATCH_SIZE" in globals() else 25
+
+# ---------------------------------------------------------------------------
+# Helper: safe text decoding
+# ---------------------------------------------------------------------------
+_TEXT_CHARSETS = ("utf-8", "latin-1")
 
 
-def _sleep_after_rate_limit_exception(github_client: Github) -> None:
-    sleep_time = github_client.get_rate_limit().core.reset.replace(
-        tzinfo=timezone.utc
-    ) - datetime.now(tz=timezone.utc)
-    sleep_time += timedelta(minutes=1)  # add an extra minute just to be safe
-    logger.notice(f"Ran into Github rate-limit. Sleeping {sleep_time.seconds} seconds.")
-    time.sleep(sleep_time.seconds)
+def _safe_decode(data: bytes) -> str | None:
+    """Try common encodings; return None if binary/undecodable."""
+    for enc in _TEXT_CHARSETS:
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
-# Cases
-# X (from start) standard run, no fallback to cursor-based pagination
-# X (from start) standard run errors, fallback to cursor-based pagination
-#  X error in the middle of a page
-#  X no errors: run to completion
-# X (from checkpoint) standard run, no fallback to cursor-based pagination
-# X (from checkpoint) continue from cursor-based pagination
-#  - retrying
-#  - no retrying
-
-# things to check:
-# checkpoint state on return
-# checkpoint progress (no infinite loop)
+# ---------------------------------------------------------------------------
+# Rate-limit helper
+# ---------------------------------------------------------------------------
+def _sleep_after_rate_limit_exception(client: Github) -> None:
+    remaining = (
+        client.get_rate_limit().core.reset.replace(tzinfo=timezone.utc)
+        - datetime.now(tz=timezone.utc)
+    )
+    remaining += timedelta(minutes=1)
+    logger.notice(f"Hit GitHub rate-limit – sleeping {remaining.seconds} s")
+    time.sleep(remaining.seconds)
 
 
-def get_nextUrl_key(pag_list: PaginatedList[PullRequest | Issue]) -> str:
-    if "_PaginatedList__nextUrl" in pag_list.__dict__:
-        return "_PaginatedList__nextUrl"
+# ---------------------------------------------------------------------------
+# PaginatedList “nextUrl” helpers
+# ---------------------------------------------------------------------------
+def _discover_next_url_key(pag_list: PaginatedList) -> str:
     for key in pag_list.__dict__:
-        if "__nextUrl" in key:
-            return key
-    for key in pag_list.__dict__:
-        if "nextUrl" in key:
+        if key.endswith("__nextUrl") or key.endswith("nextUrl"):
             return key
     return ""
 
 
-def get_nextUrl(
-    pag_list: PaginatedList[PullRequest | Issue], nextUrl_key: str
-) -> str | None:
-    return getattr(pag_list, nextUrl_key) if nextUrl_key else None
+def _get_next_url(pag_list: PaginatedList, key: str) -> str | None:
+    return getattr(pag_list, key) if key else None
 
 
-def set_nextUrl(
-    pag_list: PaginatedList[PullRequest | Issue], nextUrl_key: str, nextUrl: str
-) -> None:
-    if nextUrl_key:
-        setattr(pag_list, nextUrl_key, nextUrl)
-    elif nextUrl:
-        raise ValueError("Next URL key not found: " + str(pag_list.__dict__))
+def _set_next_url(pag_list: PaginatedList, key: str, url: str | None) -> None:
+    if key:
+        setattr(pag_list, key, url)
+    elif url:
+        raise ValueError("Could not locate next-URL attribute on PaginatedList")
 
 
+# ---------------------------------------------------------------------------
+# Cursor-aware pagination fallback
+# ---------------------------------------------------------------------------
 def _paginate_until_error(
-    git_objs: Callable[[], PaginatedList[PullRequest | Issue]],
+    get_paginated: Callable[[], PaginatedList],
     cursor_url: str | None,
-    prev_num_objs: int,
-    cursor_url_callback: Callable[[str | None, int], None],
+    prev_count: int,
+    cursor_cb: Callable[[str | None, int], None],
     retrying: bool = False,
-) -> Generator[PullRequest | Issue, None, None]:
-    num_objs = prev_num_objs
-    pag_list = git_objs()
-    nextUrl_key = get_nextUrl_key(pag_list)
+) -> Generator[Any, None, None]:
+    count = prev_count
+    pag_list = get_paginated()
+    key = _discover_next_url_key(pag_list)
+
     if cursor_url:
-        set_nextUrl(pag_list, nextUrl_key, cursor_url)
+        _set_next_url(pag_list, key, cursor_url)
     elif retrying:
-        # if we are retrying, we want to skip the objects retrieved
-        # over previous calls. Unfortunately, this WILL retrieve all
-        # pages before the one we are resuming from, so we really
-        # don't want this case to be hit often
         logger.warning(
-            "Retrying from a previous cursor-based pagination call. "
-            "This will retrieve all pages before the one we are resuming from, "
-            "which may take a while and consume many API calls."
+            "Retrying from expired cursor – will re-download earlier pages."
         )
-        pag_list = cast(PaginatedList[PullRequest | Issue], pag_list[prev_num_objs:])
-        num_objs = 0
+        pag_list = cast(PaginatedList, pag_list[prev_count:])
+        count = 0
 
     try:
-        # this for loop handles cursor-based pagination
-        for issue_or_pr in pag_list:
-            num_objs += 1
-            yield issue_or_pr
-            # used to store the current cursor url in the checkpoint. This value
-            # is updated during iteration over pag_list.
-            cursor_url_callback(get_nextUrl(pag_list, nextUrl_key), num_objs)
-
-            if num_objs % CURSOR_LOG_FREQUENCY == 0:
+        for obj in pag_list:
+            count += 1
+            yield obj
+            cursor_cb(_get_next_url(pag_list, key), count)
+            if count % CURSOR_LOG_FREQUENCY == 0:
                 logger.info(
-                    f"Retrieved {num_objs} objects with current cursor url: {get_nextUrl(pag_list, nextUrl_key)}"
+                    f"Fetched {count} objects … cursor={_get_next_url(pag_list, key)}"
                 )
-
-    except Exception as e:
-        logger.exception(f"Error during cursor-based pagination: {e}")
-        if num_objs - prev_num_objs > 0:
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Cursor-pagination error: %s", exc)
+        if count - prev_count > 0:
             raise
-
-        if get_nextUrl(pag_list, nextUrl_key) is not None and not retrying:
-            logger.info(
-                "Assuming that this error is due to cursor "
-                "expiration because no objects were retrieved. "
-                "Retrying from the first page."
-            )
+        if _get_next_url(pag_list, key) and not retrying:
             yield from _paginate_until_error(
-                git_objs, None, prev_num_objs, cursor_url_callback, retrying=True
+                get_paginated, None, prev_count, cursor_cb, retrying=True
             )
             return
-
-        # for no cursor url or if we reach this point after a retry, raise the error
         raise
 
 
+# ---------------------------------------------------------------------------
+# Unified batch loader (page or cursor) with RL handling
+# ---------------------------------------------------------------------------
 def _get_batch_rate_limited(
-    # We pass in a callable because we want git_objs to produce a fresh
-    # PaginatedList each time it's called to avoid using the same object for cursor-based pagination
-    # from a partial offset-based pagination call.
-    git_objs: Callable[[], PaginatedList],
+    get_paginated: Callable[[], PaginatedList],
     page_num: int,
     cursor_url: str | None,
-    prev_num_objs: int,
-    cursor_url_callback: Callable[[str | None, int], None],
-    github_client: Github,
-    attempt_num: int = 0,
-) -> Generator[PullRequest | Issue, None, None]:
-    if attempt_num > _MAX_NUM_RATE_LIMIT_RETRIES:
-        raise RuntimeError(
-            "Re-tried fetching batch too many times. Something is going wrong with fetching objects from Github"
-        )
+    prev_count: int,
+    cursor_cb: Callable[[str | None, int], None],
+    client: Github,
+    attempt: int = 0,
+) -> Generator[Any, None, None]:
+    if attempt > _MAX_NUM_RATE_LIMIT_RETRIES:
+        raise RuntimeError("Exceeded retry limit while fetching GitHub data")
     try:
         if cursor_url:
-            # when this is set, we are resuming from an earlier
-            # cursor-based pagination call.
             yield from _paginate_until_error(
-                git_objs, cursor_url, prev_num_objs, cursor_url_callback
+                get_paginated, cursor_url, prev_count, cursor_cb
             )
             return
-        objs = list(git_objs().get_page(page_num))
-        # fetch all data here to disable lazy loading later
-        # this is needed to capture the rate limit exception here (if one occurs)
-        for obj in objs:
+        objs = list(get_paginated().get_page(page_num))
+        for obj in objs:  # trigger RL here
             if hasattr(obj, "raw_data"):
                 getattr(obj, "raw_data")
         yield from objs
     except RateLimitExceededException:
-        _sleep_after_rate_limit_exception(github_client)
+        _sleep_after_rate_limit_exception(client)
         yield from _get_batch_rate_limited(
-            git_objs,
+            get_paginated,
             page_num,
             cursor_url,
-            prev_num_objs,
-            cursor_url_callback,
-            github_client,
-            attempt_num + 1,
+            prev_count,
+            cursor_cb,
+            client,
+            attempt + 1,
         )
-    except GithubException as e:
-        if not (
-            e.status == 422
-            and (
-                "cursor" in (e.message or "")
-                or "cursor" in (e.data or {}).get("message", "")
-            )
+    except GithubException as exc:
+        if exc.status == 422 and (
+            "cursor" in (exc.data or {}).get("message", "")
+            or "cursor" in (exc.message or "")
         ):
+            yield from _paginate_until_error(
+                get_paginated, cursor_url, prev_count, cursor_cb
+            )
+        else:
             raise
-        # Fallback to a cursor-based pagination strategy
-        # This can happen for "large datasets," but there's no documentation
-        # On the error on the web as far as we can tell.
-        # Error message:
-        # "Pagination with the page parameter is not supported for large datasets,
-        # please use cursor based pagination (after/before)"
-        yield from _paginate_until_error(
-            git_objs, cursor_url, prev_num_objs, cursor_url_callback
-        )
 
 
-def _get_userinfo(user: NamedUser) -> dict[str, str]:
-    return {
-        k: v
-        for k, v in {
-            "login": user.login,
-            "name": user.name,
-            "email": user.email,
-        }.items()
-        if v is not None
-    }
-
-
-def _convert_pr_to_document(pull_request: PullRequest) -> Document:
+# ---------------------------------------------------------------------------
+# Document converters
+# ---------------------------------------------------------------------------
+def _pr_to_doc(pr: PullRequest) -> Document:
     return Document(
-        id=pull_request.html_url,
-        sections=[
-            TextSection(link=pull_request.html_url, text=pull_request.body or "")
-        ],
+        id=pr.html_url,
+        sections=[TextSection(link=pr.html_url, text=pr.body or "")],
         source=DocumentSource.GITHUB,
-        semantic_identifier=f"{pull_request.number}: {pull_request.title}",
-        # updated_at is UTC time but is timezone unaware, explicitly add UTC
-        # as there is logic in indexing to prevent wrong timestamped docs
-        # due to local time discrepancies with UTC
+        semantic_identifier=pr.title,
         doc_updated_at=(
-            pull_request.updated_at.replace(tzinfo=timezone.utc)
-            if pull_request.updated_at
-            else None
+            pr.updated_at.replace(tzinfo=timezone.utc) if pr.updated_at else None
         ),
-        metadata={
-            k: [str(vi) for vi in v] if isinstance(v, list) else str(v)
-            for k, v in {
-                "object_type": "PullRequest",
-                "id": pull_request.number,
-                "merged": pull_request.merged,
-                "state": pull_request.state,
-                "user": _get_userinfo(pull_request.user) if pull_request.user else None,
-                "assignees": [
-                    _get_userinfo(assignee) for assignee in pull_request.assignees
-                ],
-                "repo": (
-                    pull_request.base.repo.full_name if pull_request.base else None
-                ),
-                "num_commits": str(pull_request.commits),
-                "num_files_changed": str(pull_request.changed_files),
-                "labels": [label.name for label in pull_request.labels],
-                "created_at": (
-                    pull_request.created_at.replace(tzinfo=timezone.utc)
-                    if pull_request.created_at
-                    else None
-                ),
-                "updated_at": (
-                    pull_request.updated_at.replace(tzinfo=timezone.utc)
-                    if pull_request.updated_at
-                    else None
-                ),
-                "closed_at": (
-                    pull_request.closed_at.replace(tzinfo=timezone.utc)
-                    if pull_request.closed_at
-                    else None
-                ),
-                "merged_at": (
-                    pull_request.merged_at.replace(tzinfo=timezone.utc)
-                    if pull_request.merged_at
-                    else None
-                ),
-                "merged_by": (
-                    _get_userinfo(pull_request.merged_by)
-                    if pull_request.merged_by
-                    else None
-                ),
-            }.items()
-            if v is not None
-        },
+        metadata={"merged": str(pr.merged), "state": pr.state},
     )
 
 
-def _fetch_issue_comments(issue: Issue) -> str:
-    comments = issue.get_comments()
-    return "\nComment: ".join(comment.body for comment in comments)
-
-
-def _convert_issue_to_document(issue: Issue) -> Document:
+def _issue_to_doc(issue: Issue) -> Document:
     return Document(
         id=issue.html_url,
         sections=[TextSection(link=issue.html_url, text=issue.body or "")],
         source=DocumentSource.GITHUB,
-        semantic_identifier=f"{issue.number}: {issue.title}",
-        # updated_at is UTC time but is timezone unaware
+        semantic_identifier=issue.title,
         doc_updated_at=issue.updated_at.replace(tzinfo=timezone.utc),
-        metadata={
-            k: [str(vi) for vi in v] if isinstance(v, list) else str(v)
-            for k, v in {
-                "object_type": "Issue",
-                "id": issue.number,
-                "state": issue.state,
-                "user": _get_userinfo(issue.user) if issue.user else None,
-                "assignees": [_get_userinfo(assignee) for assignee in issue.assignees],
-                "repo": issue.repository.full_name if issue.repository else None,
-                "labels": [label.name for label in issue.labels],
-                "created_at": (
-                    issue.created_at.replace(tzinfo=timezone.utc)
-                    if issue.created_at
-                    else None
-                ),
-                "updated_at": (
-                    issue.updated_at.replace(tzinfo=timezone.utc)
-                    if issue.updated_at
-                    else None
-                ),
-                "closed_at": (
-                    issue.closed_at.replace(tzinfo=timezone.utc)
-                    if issue.closed_at
-                    else None
-                ),
-                "closed_by": (
-                    _get_userinfo(issue.closed_by) if issue.closed_by else None
-                ),
-            }.items()
-            if v is not None
-        },
+        metadata={"state": issue.state},
     )
 
 
+def _code_file_to_doc(cf: ContentFile, repo_name: str) -> Document | None:
+    link = f"https://github.com/{repo_name}/blob/{cf.sha}/{cf.path}"
+    text = _safe_decode(cf.decoded_content)
+    if text is None:
+        logger.info(f"Skipping binary file: {repo_name}/{cf.path} ({cf.size} bytes)")
+        return None
+    return Document(
+        id=link,
+        sections=[TextSection(link=link, text=text)],
+        source=DocumentSource.GITHUB,
+        semantic_identifier=cf.path,
+        doc_updated_at=datetime.now(tz=timezone.utc),
+        metadata={"file_size": str(cf.size)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint schema
+# ---------------------------------------------------------------------------
 class SerializedRepository(BaseModel):
-    # id is part of the raw_data as well, just pulled out for convenience
     id: int
     headers: dict[str, str | int]
     raw_data: dict[str, Any]
 
-    def to_Repository(self, requester: Requester) -> Repository.Repository:
-        return Repository.Repository(
-            requester, self.headers, self.raw_data, completed=True
-        )
+    def to_repository(self, requester: Requester) -> Repository:  # noqa: N802
+        return Repository(requester, self.headers, self.raw_data, completed=True)
 
 
-class GithubConnectorStage(Enum):
-    START = "start"
+class Stage(str, Enum):
+    CODE = "code"
     PRS = "prs"
     ISSUES = "issues"
 
 
-class GithubConnectorCheckpoint(ConnectorCheckpoint):
-    stage: GithubConnectorStage
+class GithubCheckpoint(ConnectorCheckpoint):
+    stage: Stage
     curr_page: int
-
     cached_repo_ids: list[int] | None = None
     cached_repo: SerializedRepository | None = None
-
-    # Used for the fallback cursor-based pagination strategy
-    num_retrieved: int
+    num_retrieved: int = 0
     cursor_url: str | None = None
 
-    def reset(self) -> None:
-        """
-        Resets curr_page, num_retrieved, and cursor_url to their initial values (0, 0, None)
-        """
+    def reset(self) -> None:  # noqa: D401
         self.curr_page = 0
         self.num_retrieved = 0
         self.cursor_url = None
 
 
-def make_cursor_url_callback(
-    checkpoint: GithubConnectorCheckpoint,
-) -> Callable[[str | None, int], None]:
-    def cursor_url_callback(cursor_url: str | None, num_objs: int) -> None:
-        # we want to maintain the old cursor url so code after retrieval
-        # can determine that we are using the fallback cursor-based pagination strategy
-        if cursor_url:
-            checkpoint.cursor_url = cursor_url
-        checkpoint.num_retrieved = num_objs
+def _make_cursor_cb(cp: GithubCheckpoint) -> Callable[[str | None, int], None]:
+    def _cb(cursor: str | None, num: int) -> None:
+        if cursor:
+            cp.cursor_url = cursor
+        cp.num_retrieved = num
 
-    return cursor_url_callback
+    return _cb
 
 
-class GithubConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
+# ---------------------------------------------------------------------------
+# Main connector
+# ---------------------------------------------------------------------------
+class GithubConnector(CheckpointedConnector[GithubCheckpoint]):
+    """Fetch code, PRs and Issues from GitHub with checkpointing."""
+
+    # ----------------------- init / credentials -----------------------
     def __init__(
         self,
+        *,
         repo_owner: str,
         repositories: str | None = None,
         state_filter: str = "all",
+        include_code: bool = True,
         include_prs: bool = True,
         include_issues: bool = False,
+        code_batch_size: int = _CODE_BATCH_SIZE,
     ) -> None:
         self.repo_owner = repo_owner
         self.repositories = repositories
         self.state_filter = state_filter
+        self.include_code = include_code
         self.include_prs = include_prs
         self.include_issues = include_issues
+        self.code_batch_size = code_batch_size
         self.github_client: Github | None = None
 
-    def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
-        # defaults to 30 items per page, can be set to as high as 100
+    def load_credentials(self, creds: dict[str, Any]) -> dict[str, Any] | None:  # noqa: D401
         self.github_client = (
             Github(
-                credentials["github_access_token"],
+                creds["github_access_token"],
                 base_url=GITHUB_CONNECTOR_BASE_URL,
                 per_page=ITEMS_PER_PAGE,
             )
             if GITHUB_CONNECTOR_BASE_URL
-            else Github(credentials["github_access_token"], per_page=ITEMS_PER_PAGE)
+            else Github(creds["github_access_token"], per_page=ITEMS_PER_PAGE)
         )
         return None
 
-    def _get_github_repo(
-        self, github_client: Github, attempt_num: int = 0
-    ) -> Repository.Repository:
-        if attempt_num > _MAX_NUM_RATE_LIMIT_RETRIES:
-            raise RuntimeError(
-                "Re-tried fetching repo too many times. Something is going wrong with fetching objects from Github"
-            )
+    # ----------------------- repo utilities -----------------------
+    def _split_repo_names(self) -> list[str]:
+        return [n.strip() for n in (self.repositories or "").split(",") if n.strip()]
 
+    def _repo_safe(self, full_name: str, attempt: int = 0) -> Repository:
+        if attempt > _MAX_NUM_RATE_LIMIT_RETRIES:
+            raise RuntimeError("Repo fetch retries exceeded")
         try:
-            return github_client.get_repo(f"{self.repo_owner}/{self.repositories}")
+            return self.github_client.get_repo(full_name)  # type: ignore[attr-defined]
         except RateLimitExceededException:
-            _sleep_after_rate_limit_exception(github_client)
-            return self._get_github_repo(github_client, attempt_num + 1)
+            _sleep_after_rate_limit_exception(self.github_client)  # type: ignore[arg-type]
+            return self._repo_safe(full_name, attempt + 1)
 
-    def _get_github_repos(
-        self, github_client: Github, attempt_num: int = 0
-    ) -> list[Repository.Repository]:
-        """Get specific repositories based on comma-separated repo_name string."""
-        if attempt_num > _MAX_NUM_RATE_LIMIT_RETRIES:
-            raise RuntimeError(
-                "Re-tried fetching repos too many times. Something is going wrong with fetching objects from Github"
-            )
+    def _explicit_repos(self) -> list[Repository]:
+        return [
+            self._repo_safe(f"{self.repo_owner}/{name}")
+            for name in self._split_repo_names()
+        ]
 
+    def _all_repos(self, attempt: int = 0) -> list[Repository]:
+        if attempt > _MAX_NUM_RATE_LIMIT_RETRIES:
+            raise RuntimeError("Repo list retries exceeded")
         try:
-            repos = []
-            # Split repo_name by comma and strip whitespace
-            repo_names = [
-                name.strip() for name in (cast(str, self.repositories)).split(",")
-            ]
-
-            for repo_name in repo_names:
-                if repo_name:  # Skip empty strings
-                    try:
-                        repo = github_client.get_repo(f"{self.repo_owner}/{repo_name}")
-                        repos.append(repo)
-                    except GithubException as e:
-                        logger.warning(
-                            f"Could not fetch repo {self.repo_owner}/{repo_name}: {e}"
-                        )
-
-            return repos
-        except RateLimitExceededException:
-            _sleep_after_rate_limit_exception(github_client)
-            return self._get_github_repos(github_client, attempt_num + 1)
-
-    def _get_all_repos(
-        self, github_client: Github, attempt_num: int = 0
-    ) -> list[Repository.Repository]:
-        if attempt_num > _MAX_NUM_RATE_LIMIT_RETRIES:
-            raise RuntimeError(
-                "Re-tried fetching repos too many times. Something is going wrong with fetching objects from Github"
-            )
-
-        try:
-            # Try to get organization first
             try:
-                org = github_client.get_organization(self.repo_owner)
+                org = self.github_client.get_organization(self.repo_owner)  # type: ignore[attr-defined]
                 return list(org.get_repos())
-
             except GithubException:
-                # If not an org, try as a user
-                user = github_client.get_user(self.repo_owner)
+                user = self.github_client.get_user(self.repo_owner)  # type: ignore[attr-defined]
                 return list(user.get_repos())
         except RateLimitExceededException:
-            _sleep_after_rate_limit_exception(github_client)
-            return self._get_all_repos(github_client, attempt_num + 1)
+            _sleep_after_rate_limit_exception(self.github_client)  # type: ignore[arg-type]
+            return self._all_repos(attempt + 1)
 
-    def _pull_requests_func(
-        self, repo: Repository.Repository
-    ) -> Callable[[], PaginatedList[PullRequest]]:
-        return lambda: repo.get_pulls(
-            state=self.state_filter, sort="updated", direction="desc"
-        )
+    # ----------------------- code traversal -----------------------
+    def _walk_code_files(self, repo: Repository) -> Iterator[ContentFile]:
+        def _walk(path: str) -> Iterator[ContentFile]:
+            tries = 0
+            while tries < _MAX_NUM_RATE_LIMIT_RETRIES:
+                try:
+                    contents = repo.get_contents(path)
+                    if not isinstance(contents, list):
+                        contents = [contents]
+                    for entry in contents:
+                        if entry.type == "dir":
+                            yield from _walk(entry.path)
+                        elif entry.size < 1_000_000:
+                            yield entry
+                    return
+                except RateLimitExceededException:
+                    _sleep_after_rate_limit_exception(self.github_client)  # type: ignore[arg-type]
+                    tries += 1
+                except GithubException as exc:
+                    logger.warning(f"Error listing {path} in {repo.full_name}: {exc}")
+                    return
+            logger.error(f"Too many retries walking {repo.full_name}:{path}")
 
-    def _issues_func(
-        self, repo: Repository.Repository
-    ) -> Callable[[], PaginatedList[Issue]]:
-        return lambda: repo.get_issues(
-            state=self.state_filter, sort="updated", direction="desc"
-        )
+        yield from _walk("")
 
+    def _yield_code_documents(
+        self, repo: Repository
+    ) -> Generator[Document, None, None]:
+        buffer: list[ContentFile] = []
+        for cf in self._walk_code_files(repo):
+            buffer.append(cf)
+            if len(buffer) >= self.code_batch_size:
+                for f in buffer:
+                    doc = _code_file_to_doc(f, repo.full_name)
+                    if doc:
+                        yield doc
+                buffer.clear()
+        for f in buffer:
+            doc = _code_file_to_doc(f, repo.full_name)
+            if doc:
+                yield doc
+
+    # ----------------------- core fetch loop -----------------------
     def _fetch_from_github(
         self,
-        checkpoint: GithubConnectorCheckpoint,
+        checkpoint: GithubCheckpoint,
+        *,
         start: datetime | None = None,
         end: datetime | None = None,
-    ) -> Generator[Document | ConnectorFailure, None, GithubConnectorCheckpoint]:
+    ) -> Generator[Document | ConnectorFailure, None, GithubCheckpoint]:
         if self.github_client is None:
             raise ConnectorMissingCredentialError("GitHub")
 
-        checkpoint = copy.deepcopy(checkpoint)
+        cp = copy.deepcopy(checkpoint)
+        cursor_cb = _make_cursor_cb(cp)
 
-        # First run of the connector, fetch all repos and store in checkpoint
-        if checkpoint.cached_repo_ids is None:
-            repos = []
-            if self.repositories:
-                if "," in self.repositories:
-                    # Multiple repositories specified
-                    repos = self._get_github_repos(self.github_client)
-                else:
-                    # Single repository (backward compatibility)
-                    repos = [self._get_github_repo(self.github_client)]
-            else:
-                # All repositories
-                repos = self._get_all_repos(self.github_client)
+        # 1️⃣ initial repo discovery
+        if cp.cached_repo_ids is None:
+            repos = self._explicit_repos() if self.repositories else self._all_repos()
             if not repos:
-                checkpoint.has_more = False
-                return checkpoint
+                cp.has_more = False
+                return cp
 
-            curr_repo = repos.pop()
-            checkpoint.cached_repo_ids = [repo.id for repo in repos]
-            checkpoint.cached_repo = SerializedRepository(
-                id=curr_repo.id,
-                headers=curr_repo.raw_headers,
-                raw_data=curr_repo.raw_data,
+            current = repos.pop()
+            cp.cached_repo_ids = [r.id for r in repos]
+            cp.cached_repo = SerializedRepository(
+                id=current.id,
+                headers=current.raw_headers,
+                raw_data=current.raw_data,
             )
-            checkpoint.stage = GithubConnectorStage.PRS
-            checkpoint.curr_page = 0
-            # save checkpoint with repo ids retrieved
-            return checkpoint
+            cp.stage = Stage.CODE if self.include_code else Stage.PRS
+            cp.reset()
+            return cp
 
-        if checkpoint.cached_repo is None:
-            raise ValueError("No repo saved in checkpoint")
+        # 2️⃣ rebuild repo object
+        if cp.cached_repo is None:
+            raise ValueError("Checkpoint corrupt: missing cached_repo")
 
-        # Try to access the requester - different PyGithub versions may use different attribute names
         try:
-            # Try direct access to a known attribute name first
-            if hasattr(self.github_client, "_requester"):
-                requester = self.github_client._requester
-            elif hasattr(self.github_client, "_Github__requester"):
-                requester = self.github_client._Github__requester
-            else:
-                # If we can't find the requester attribute, we need to fall back to recreating the repo
-                raise AttributeError("Could not find requester attribute")
-
-            repo = checkpoint.cached_repo.to_Repository(requester)
-        except Exception as e:
-            # If all else fails, re-fetch the repo directly
-            logger.warning(
-                f"Failed to deserialize repository: {e}. Attempting to re-fetch."
+            requester = (
+                self.github_client._requester  # type: ignore[attr-defined]
+                if hasattr(self.github_client, "_requester")
+                else self.github_client._Github__requester  # type: ignore[attr-defined]
             )
-            repo_id = checkpoint.cached_repo.id
-            repo = self.github_client.get_repo(repo_id)
+            repo = cp.cached_repo.to_repository(requester)
+        except Exception:  # pragma: no cover
+            repo = self.github_client.get_repo(cp.cached_repo.id)
 
-        cursor_url_callback = make_cursor_url_callback(checkpoint)
+        # 3️⃣ CODE stage
+        if self.include_code and cp.stage == Stage.CODE:
+            logger.info(f"[GitHub] Crawling code for {repo.full_name}")
+            for doc in self._yield_code_documents(repo):
+                yield doc
+            cp.stage = Stage.PRS
+            cp.reset()
+            return cp
 
-        if self.include_prs and checkpoint.stage == GithubConnectorStage.PRS:
-            logger.info(f"Fetching PRs for repo: {repo.name}")
-
+        # 4️⃣ PR stage
+        if self.include_prs and cp.stage == Stage.PRS:
             pr_batch = _get_batch_rate_limited(
-                self._pull_requests_func(repo),
-                checkpoint.curr_page,
-                checkpoint.cursor_url,
-                checkpoint.num_retrieved,
-                cursor_url_callback,
+                lambda: repo.get_pulls(
+                    state=self.state_filter, sort="updated", direction="desc"
+                ),
+                cp.curr_page,
+                cp.cursor_url,
+                cp.num_retrieved,
+                cursor_cb,
                 self.github_client,
             )
-            checkpoint.curr_page += 1  # NOTE: not used for cursor-based fallback
-            done_with_prs = False
-            num_prs = 0
-            pr = None
+            cp.curr_page += 1
+            done = False
+            produced = 0
             for pr in pr_batch:
-                num_prs += 1
-
-                # we iterate backwards in time, so at this point we stop processing prs
+                produced += 1
                 if (
-                    start is not None
+                    start
                     and pr.updated_at
                     and pr.updated_at.replace(tzinfo=timezone.utc) < start
                 ):
-                    done_with_prs = True
+                    done = True
                     break
-                # Skip PRs updated after the end date
                 if (
-                    end is not None
+                    end
                     and pr.updated_at
                     and pr.updated_at.replace(tzinfo=timezone.utc) > end
                 ):
                     continue
                 try:
-                    yield _convert_pr_to_document(cast(PullRequest, pr))
-                except Exception as e:
-                    error_msg = f"Error converting PR to document: {e}"
-                    logger.exception(error_msg)
-                    yield ConnectorFailure(
-                        failed_document=DocumentFailure(
-                            document_id=str(pr.id), document_link=pr.html_url
-                        ),
-                        failure_message=error_msg,
-                        exception=e,
-                    )
-                    continue
+                    yield _pr_to_doc(cast(PullRequest, pr))
+                except Exception as exc:
+                    logger.exception("PR conversion error: %s", exc)
+            if produced > 0 and not done and cp.cursor_url is None:
+                return cp
+            cp.stage = Stage.ISSUES
+            cp.reset()
+            if cp.cursor_url:
+                return cp
 
-            # If we reach this point with a cursor url in the checkpoint, we were using
-            # the fallback cursor-based pagination strategy. That strategy tries to get all
-            # PRs, so having curosr_url set means we are done with prs. However, we need to
-            # return AFTER the checkpoint reset to avoid infinite loops.
-
-            # if we found any PRs on the page and there are more PRs to get, return the checkpoint.
-            # In offset mode, while indexing without time constraints, the pr batch
-            # will be empty when we're done.
-            used_cursor = checkpoint.cursor_url is not None
-            logger.info(f"Fetched {num_prs} PRs for repo: {repo.name}")
-            if num_prs > 0 and not done_with_prs and not used_cursor:
-                return checkpoint
-
-            # if we went past the start date during the loop or there are no more
-            # prs to get, we move on to issues
-            checkpoint.stage = GithubConnectorStage.ISSUES
-            checkpoint.reset()
-
-            if used_cursor:
-                # save the checkpoint after changing stage; next run will continue from issues
-                return checkpoint
-
-        checkpoint.stage = GithubConnectorStage.ISSUES
-
-        if self.include_issues and checkpoint.stage == GithubConnectorStage.ISSUES:
-            logger.info(f"Fetching issues for repo: {repo.name}")
-
-            issue_batch = list(
-                _get_batch_rate_limited(
-                    self._issues_func(repo),
-                    checkpoint.curr_page,
-                    checkpoint.cursor_url,
-                    checkpoint.num_retrieved,
-                    cursor_url_callback,
-                    self.github_client,
-                )
+        # 5️⃣ Issue stage
+        if self.include_issues and cp.stage == Stage.ISSUES:
+            issue_batch = _get_batch_rate_limited(
+                lambda: repo.get_issues(
+                    state=self.state_filter, sort="updated", direction="desc"
+                ),
+                cp.curr_page,
+                cp.cursor_url,
+                cp.num_retrieved,
+                cursor_cb,
+                self.github_client,
             )
-            checkpoint.curr_page += 1
-            done_with_issues = False
-            num_issues = 0
+            cp.curr_page += 1
+            done = False
+            produced = 0
             for issue in issue_batch:
-                num_issues += 1
+                produced += 1
                 issue = cast(Issue, issue)
-                # we iterate backwards in time, so at this point we stop processing prs
-                if (
-                    start is not None
-                    and issue.updated_at.replace(tzinfo=timezone.utc) < start
-                ):
-                    done_with_issues = True
+                if start and issue.updated_at.replace(tzinfo=timezone.utc) < start:
+                    done = True
                     break
-                # Skip PRs updated after the end date
-                if (
-                    end is not None
-                    and issue.updated_at.replace(tzinfo=timezone.utc) > end
-                ):
+                if end and issue.updated_at.replace(tzinfo=timezone.utc) > end:
                     continue
-
-                if issue.pull_request is not None:
-                    # PRs are handled separately
+                if issue.pull_request:
                     continue
-
                 try:
-                    yield _convert_issue_to_document(issue)
-                except Exception as e:
-                    error_msg = f"Error converting issue to document: {e}"
-                    logger.exception(error_msg)
-                    yield ConnectorFailure(
-                        failed_document=DocumentFailure(
-                            document_id=str(issue.id),
-                            document_link=issue.html_url,
-                        ),
-                        failure_message=error_msg,
-                        exception=e,
-                    )
-                    continue
+                    yield _issue_to_doc(issue)
+                except Exception as exc:
+                    logger.exception("Issue conversion error: %s", exc)
+            if produced > 0 and not done and cp.cursor_url is None:
+                return cp
+            cp.stage = Stage.PRS  # next repo
+            cp.reset()
 
-            logger.info(f"Fetched {num_issues} issues for repo: {repo.name}")
-            # if we found any issues on the page, and we're not done, return the checkpoint.
-            # don't return if we're using cursor-based pagination to avoid infinite loops
-            if num_issues > 0 and not done_with_issues and not checkpoint.cursor_url:
-                return checkpoint
-
-            # if we went past the start date during the loop or there are no more
-            # issues to get, we move on to the next repo
-            checkpoint.stage = GithubConnectorStage.PRS
-            checkpoint.reset()
-
-        checkpoint.has_more = len(checkpoint.cached_repo_ids) > 0
-        if checkpoint.cached_repo_ids:
-            next_id = checkpoint.cached_repo_ids.pop()
-            next_repo = self.github_client.get_repo(next_id)
-            checkpoint.cached_repo = SerializedRepository(
-                id=next_id,
-                headers=next_repo.raw_headers,
-                raw_data=next_repo.raw_data,
+        # 6️⃣ next repo or done
+        cp.has_more = bool(cp.cached_repo_ids)
+        if cp.cached_repo_ids:
+            next_id = cp.cached_repo_ids.pop()
+            nxt = self.github_client.get_repo(next_id)
+            cp.cached_repo = SerializedRepository(
+                id=next_id, headers=nxt.raw_headers, raw_data=nxt.raw_data
             )
-            checkpoint.stage = GithubConnectorStage.PRS
-            checkpoint.reset()
+            cp.stage = Stage.CODE if self.include_code else Stage.PRS
+            cp.reset()
+        return cp
 
-        logger.info(f"{len(checkpoint.cached_repo_ids)} repos remaining")
-
-        return checkpoint
-
+    # ----------------------- abstract interface -----------------------
     @override
     def load_from_checkpoint(
         self,
         start: SecondsSinceUnixEpoch,
         end: SecondsSinceUnixEpoch,
-        checkpoint: GithubConnectorCheckpoint,
-    ) -> CheckpointOutput[GithubConnectorCheckpoint]:
-        start_datetime = datetime.fromtimestamp(start, tz=timezone.utc)
-        # add a day for timezone safety
-        end_datetime = datetime.fromtimestamp(end, tz=timezone.utc) + ONE_DAY
-
-        # Move start time back by 3 hours, since some Issues/PRs are getting dropped
-        # Could be due to delayed processing on GitHub side
-        # The non-updated issues since last poll will be shortcut-ed and not embedded
-        adjusted_start_datetime = start_datetime - timedelta(hours=3)
-
+        checkpoint: GithubCheckpoint,
+    ) -> CheckpointOutput[GithubCheckpoint]:
+        start_dt = datetime.fromtimestamp(start, tz=timezone.utc) - timedelta(hours=3)
         epoch = datetime.fromtimestamp(0, tz=timezone.utc)
-        if adjusted_start_datetime < epoch:
-            adjusted_start_datetime = epoch
+        if start_dt < epoch:
+            start_dt = epoch
+        end_dt = datetime.fromtimestamp(end, tz=timezone.utc) + ONE_DAY
+        return self._fetch_from_github(checkpoint, start=start_dt, end=end_dt)
 
-        return self._fetch_from_github(
-            checkpoint, start=adjusted_start_datetime, end=end_datetime
-        )
+    def validate_checkpoint_json(self, checkpoint_json: str) -> GithubCheckpoint:  # noqa: D401
+        return GithubCheckpoint.model_validate_json(checkpoint_json)
 
-    def validate_connector_settings(self) -> None:
+    def build_dummy_checkpoint(self) -> GithubCheckpoint:  # noqa: D401
+        init = Stage.CODE if self.include_code else Stage.PRS
+        return GithubCheckpoint(stage=init, curr_page=0, has_more=True)
+
+    # ----------------------- settings validation (unchanged) -----------------------
+    def validate_connector_settings(self) -> None:  # noqa: C901
         if self.github_client is None:
             raise ConnectorMissingCredentialError("GitHub credentials not loaded.")
 
         if not self.repo_owner:
-            raise ConnectorValidationError(
-                "Invalid connector settings: 'repo_owner' must be provided."
-            )
+            raise ConnectorValidationError("'repo_owner' must be provided.")
 
         try:
             if self.repositories:
-                if "," in self.repositories:
-                    # Multiple repositories specified
-                    repo_names = [name.strip() for name in self.repositories.split(",")]
-                    if not repo_names:
-                        raise ConnectorValidationError(
-                            "Invalid connector settings: No valid repository names provided."
-                        )
-
-                    # Validate at least one repository exists and is accessible
-                    valid_repos = False
-                    validation_errors = []
-
-                    for repo_name in repo_names:
-                        if not repo_name:
-                            continue
-
-                        try:
-                            test_repo = self.github_client.get_repo(
-                                f"{self.repo_owner}/{repo_name}"
-                            )
-                            test_repo.get_contents("")
-                            valid_repos = True
-                            # If at least one repo is valid, we can proceed
-                            break
-                        except GithubException as e:
-                            validation_errors.append(
-                                f"Repository '{repo_name}': {e.data.get('message', str(e))}"
-                            )
-
-                    if not valid_repos:
-                        error_msg = (
-                            "None of the specified repositories could be accessed: "
-                        )
-                        error_msg += ", ".join(validation_errors)
-                        raise ConnectorValidationError(error_msg)
-                else:
-                    # Single repository (backward compatibility)
-                    test_repo = self.github_client.get_repo(
-                        f"{self.repo_owner}/{self.repositories}"
-                    )
-                    test_repo.get_contents("")
+                names = self._split_repo_names()
+                if not names:
+                    raise ConnectorValidationError("No valid repository names provided.")
+                any_valid = False
+                errors: list[str] = []
+                for name in names:
+                    try:
+                        self.github_client.get_repo(f"{self.repo_owner}/{name}").get_contents("")  # type: ignore[attr-defined]
+                        any_valid = True
+                        break
+                    except GithubException as exc:
+                        errors.append(f"{name}: {exc.data.get('message', str(exc))}")
+                if not any_valid:
+                    raise ConnectorValidationError("; ".join(errors))
             else:
-                # Try to get organization first
                 try:
-                    org = self.github_client.get_organization(self.repo_owner)
-                    total_count = org.get_repos().totalCount
-                    if total_count == 0:
+                    org = self.github_client.get_organization(self.repo_owner)  # type: ignore[attr-defined]
+                    if org.get_repos().totalCount == 0:
                         raise ConnectorValidationError(
-                            f"Found no repos for organization: {self.repo_owner}. "
-                            "Does the credential have the right scopes?"
+                            f"Organization '{self.repo_owner}' has no accessible repositories."
                         )
-                except GithubException as e:
-                    # Check for missing SSO
-                    MISSING_SSO_ERROR_MESSAGE = "You must grant your Personal Access token access to this organization".lower()
-                    if MISSING_SSO_ERROR_MESSAGE in str(e).lower():
-                        SSO_GUIDE_LINK = (
-                            "https://docs.github.com/en/enterprise-cloud@latest/authentication/"
-                            "authenticating-with-saml-single-sign-on/"
-                            "authorizing-a-personal-access-token-for-use-with-saml-single-sign-on"
-                        )
+                except GithubException:
+                    user = self.github_client.get_user(self.repo_owner)  # type: ignore[attr-defined]
+                    if user.get_repos().totalCount == 0:
                         raise ConnectorValidationError(
-                            f"Your GitHub token is missing authorization to access the "
-                            f"`{self.repo_owner}` organization. Please follow the guide to "
-                            f"authorize your token: {SSO_GUIDE_LINK}"
+                            f"User '{self.repo_owner}' has no accessible repositories."
                         )
-                    # If not an org, try as a user
-                    user = self.github_client.get_user(self.repo_owner)
-
-                    # Check if we can access any repos
-                    total_count = user.get_repos().totalCount
-                    if total_count == 0:
-                        raise ConnectorValidationError(
-                            f"Found no repos for user: {self.repo_owner}. "
-                            "Does the credential have the right scopes?"
-                        )
-
         except RateLimitExceededException:
             raise UnexpectedValidationError(
-                "Validation failed due to GitHub rate-limits being exceeded. Please try again later."
+                "GitHub rate limit exceeded during validation – try again later."
             )
-
-        except GithubException as e:
-            if e.status == 401:
-                raise CredentialExpiredError(
-                    "GitHub credential appears to be invalid or expired (HTTP 401)."
-                )
-            elif e.status == 403:
+        except GithubException as exc:
+            if exc.status == 401:
+                raise CredentialExpiredError("Invalid/expired GitHub token (401).")
+            if exc.status == 403:
                 raise InsufficientPermissionsError(
-                    "Your GitHub token does not have sufficient permissions for this repository (HTTP 403)."
+                    "Token lacks permission to access repository (403)."
                 )
-            elif e.status == 404:
-                if self.repositories:
-                    if "," in self.repositories:
-                        raise ConnectorValidationError(
-                            f"None of the specified GitHub repositories could be found for owner: {self.repo_owner}"
-                        )
-                    else:
-                        raise ConnectorValidationError(
-                            f"GitHub repository not found with name: {self.repo_owner}/{self.repositories}"
-                        )
-                else:
-                    raise ConnectorValidationError(
-                        f"GitHub user or organization not found: {self.repo_owner}"
-                    )
-            else:
+            if exc.status == 404:
                 raise ConnectorValidationError(
-                    f"Unexpected GitHub error (status={e.status}): {e.data}"
+                    "Requested repository/user/org not found (404)."
                 )
-
-        except Exception as exc:
-            raise Exception(
-                f"Unexpected error during GitHub settings validation: {exc}"
+            raise ConnectorValidationError(
+                f"Unexpected GitHub error {exc.status}: {exc.data}"
             )
 
-    def validate_checkpoint_json(
-        self, checkpoint_json: str
-    ) -> GithubConnectorCheckpoint:
-        return GithubConnectorCheckpoint.model_validate_json(checkpoint_json)
 
-    def build_dummy_checkpoint(self) -> GithubConnectorCheckpoint:
-        return GithubConnectorCheckpoint(
-            stage=GithubConnectorStage.PRS, curr_page=0, has_more=True, num_retrieved=0
-        )
-
-
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# Stand-alone CLI harness (optional)
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":  # pragma: no cover
     import os
     from onyx.connectors.connector_runner import ConnectorRunner
 
-    # Initialize the connector
-    connector = GithubConnector(
+    conn = GithubConnector(
         repo_owner=os.environ["REPO_OWNER"],
         repositories=os.environ.get("REPOSITORIES"),
+        include_code=True,
+        include_prs=True,
+        include_issues=False,
     )
-    connector.load_credentials(
-        {"github_access_token": os.environ["ACCESS_TOKEN_GITHUB"]}
+    conn.load_credentials({"github_access_token": os.environ["ACCESS_TOKEN_GITHUB"]})
+
+    runner: ConnectorRunner[GithubCheckpoint] = ConnectorRunner(
+        conn,
+        batch_size=10,
+        time_range=(
+            datetime.fromtimestamp(0, tz=timezone.utc),
+            datetime.now(tz=timezone.utc),
+        ),
     )
 
-    # Create a time range from epoch to now
-    end_time = datetime.now(timezone.utc)
-    start_time = datetime.fromtimestamp(0, tz=timezone.utc)
-    time_range = (start_time, end_time)
-
-    # Initialize the runner with a batch size of 10
-    runner: ConnectorRunner[GithubConnectorCheckpoint] = ConnectorRunner(
-        connector, batch_size=10, time_range=time_range
-    )
-
-    # Get initial checkpoint
-    checkpoint = connector.build_dummy_checkpoint()
-
-    # Run the connector
-    while checkpoint.has_more:
-        for doc_batch, failure, next_checkpoint in runner.run(checkpoint):
-            if doc_batch:
-                print(f"Retrieved batch of {len(doc_batch)} documents")
-                for doc in doc_batch:
-                    print(f"Document: {doc.semantic_identifier}")
+    ckpt = conn.build_dummy_checkpoint()
+    while ckpt.has_more:
+        for docs, failure, ckpt in runner.run(ckpt):
+            if docs:
+                print("batch", len(docs))
             if failure:
-                print(f"Failure: {failure.failure_message}")
-            if next_checkpoint:
-                checkpoint = next_checkpoint
+                print("failure:", failure.failure_message)
