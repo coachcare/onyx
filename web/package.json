@@ -96,7 +96,7 @@
   },
   "devDependencies": {
     "@chromatic-com/playwright": "^0.10.2",
-    "@playwright/test": "^1.39.0",
+    "@playwright/test": "^1.56.1",
     "@tailwindcss/typography": "^0.5.10",
     "@types/chrome": "^0.0.287",
     "@types/jest": "^29.5.14",
